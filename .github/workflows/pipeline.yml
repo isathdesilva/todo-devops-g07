@@ -1,0 +1,153 @@
+# Push to main -> CI/Build server (GitHub Actions runner) builds + unit tests -> Test/Staging server integration + E2E
+# -> one manual approval -> the SAME image is deployed to Production -> /health check.
+name: CI-CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: pipeline-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/ec2.pem
+
+jobs:
+  # ------------------------------------------------------------------ CI/BUILD SERVER
+  build:
+    name: Build image + unit tests (CI/Build server - GitHub Actions)
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.names.outputs.image }}
+      test_image: ${{ steps.names.outputs.test_image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image names (lowercase, tagged with commit SHA)
+        id: names
+        run: |
+          REPO=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=$REPO:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "test_image=$REPO-test:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build production image
+        run: |
+          START=$(date +%s)
+          docker build --target prod --build-arg APP_VERSION=${GITHUB_SHA::7} -t ${{ steps.names.outputs.image }} .
+          echo "Production image build time: $(( $(date +%s) - START ))s" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Build test image
+        run: docker build --target test -t ${{ steps.names.outputs.test_image }} .
+
+      - name: Run unit tests with coverage (fails if statements < 80%)
+        run: docker run --rm ${{ steps.names.outputs.test_image }} npm run test:unit
+
+      - name: Push images
+        run: |
+          docker push ${{ steps.names.outputs.image }}
+          docker push ${{ steps.names.outputs.test_image }}
+
+  # ------------------------------------------------------------------ TEST/STAGING SERVER
+  staging:
+    name: Deploy + integration/E2E tests (Test/Staging server)
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2.pem
+          chmod 600 ~/.ssh/ec2.pem
+
+      - name: Copy deployment files
+        run: |
+          ssh $SSH_OPTS ubuntu@${{ secrets.STAGING_HOST }} "mkdir -p ~/todo"
+          scp $SSH_OPTS deploy/docker-compose.yml ubuntu@${{ secrets.STAGING_HOST }}:~/todo/docker-compose.yml
+
+      - name: Deploy image to staging
+        run: |
+          ssh $SSH_OPTS ubuntu@${{ secrets.STAGING_HOST }} bash -s <<EOF
+          set -e
+          cd ~/todo
+          printf "IMAGE=%s\nAPP_ENV=staging\nPOSTGRES_PASSWORD=%s\n" "${{ needs.build.outputs.image }}" "${{ secrets.DB_PASSWORD }}" > .env
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker compose pull app
+          docker compose up -d
+          for i in \$(seq 1 30); do curl -sf http://localhost/health && exit 0; sleep 2; done
+          echo "Staging app did not become healthy"; docker compose logs app; exit 1
+          EOF
+
+      - name: Integration tests (fresh test database every run)
+        run: |
+          ssh $SSH_OPTS ubuntu@${{ secrets.STAGING_HOST }} bash -s <<EOF
+          set -e
+          docker rm -f todo-testdb >/dev/null 2>&1 || true
+          docker run -d --name todo-testdb --network todo-net -e POSTGRES_USER=todo -e POSTGRES_PASSWORD=test -e POSTGRES_DB=todo_test postgres:16-alpine
+          docker pull ${{ needs.build.outputs.test_image }}
+          sleep 5
+          RESULT=0
+          docker run --rm --network todo-net -e DB_HOST=todo-testdb -e DB_USER=todo -e DB_PASSWORD=test -e DB_NAME=todo_test \
+            ${{ needs.build.outputs.test_image }} npm run test:integration || RESULT=\$?
+          docker rm -f todo-testdb
+          exit \$RESULT
+          EOF
+
+      - name: End-to-end tests (Playwright browser against staging app)
+        run: |
+          ssh $SSH_OPTS ubuntu@${{ secrets.STAGING_HOST }} \
+            "docker run --rm --ipc=host --network todo-net -e BASE_URL=http://todo-app:3000 ${{ needs.build.outputs.test_image }} npx playwright test"
+
+  # ------------------------------------------------------------------ PRODUCTION SERVER
+  production:
+    name: Deploy to Production (needs approval)
+    needs: [build, staging]
+    runs-on: ubuntu-latest
+    environment: production    # required reviewer set in repo Settings -> Environments
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2.pem
+          chmod 600 ~/.ssh/ec2.pem
+
+      - name: Copy deployment + monitoring files
+        run: |
+          ssh $SSH_OPTS ubuntu@${{ secrets.PROD_HOST }} "mkdir -p ~/todo ~/monitoring"
+          scp $SSH_OPTS deploy/docker-compose.yml ubuntu@${{ secrets.PROD_HOST }}:~/todo/docker-compose.yml
+          scp $SSH_OPTS -r monitoring/* ubuntu@${{ secrets.PROD_HOST }}:~/monitoring/
+
+      - name: Deploy the SAME tested image to production
+        run: |
+          ssh $SSH_OPTS ubuntu@${{ secrets.PROD_HOST }} bash -s <<EOF
+          set -e
+          cd ~/todo
+          printf "IMAGE=%s\nAPP_ENV=production\nPOSTGRES_PASSWORD=%s\n" "${{ needs.build.outputs.image }}" "${{ secrets.DB_PASSWORD }}" > .env
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker compose pull app
+          docker compose up -d
+          cd ~/monitoring
+          GRAFANA_PASSWORD="${{ secrets.DB_PASSWORD }}" docker compose up -d
+          EOF
+
+      - name: Production health check (pipeline fails if not OK)
+        run: |
+          for i in $(seq 1 30); do
+            BODY=$(curl -sf http://${{ secrets.PROD_HOST }}/health) && echo "$BODY" | grep -q '"status":"OK"' && {
+              echo "Production healthy: $BODY" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; }
+            sleep 2
+          done
+          echo "Production health check FAILED"; exit 1

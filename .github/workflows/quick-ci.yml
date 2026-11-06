@@ -1,0 +1,45 @@
+# QUICK PIPELINE: runs on GitHub's own servers. No AWS needed.
+# Every push to main: build Docker image -> unit tests -> integration tests (real PostgreSQL) -> E2E browser tests.
+name: Quick CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: todo
+          POSTGRES_PASSWORD: todo
+          POSTGRES_DB: todo
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Build production Docker image
+        run: docker build --target prod -t todo-app:${{ github.sha }} .
+      - name: Unit tests + coverage
+        run: npm run test:unit
+      - name: Integration tests (real PostgreSQL)
+        run: npm run test:integration
+        env: { DB_HOST: localhost }
+      - name: Start app
+        run: |
+          DB_HOST=localhost APP_ENV=ci nohup node src/server.js > app.log 2>&1 &
+          for i in $(seq 1 20); do curl -sf http://localhost:3000/health && exit 0; sleep 1; done; cat app.log; exit 1
+      - name: End-to-end tests (Playwright)
+        run: |
+          npx playwright install --with-deps chromium
+          npm run test:e2e
+        env: { BASE_URL: http://localhost:3000 }

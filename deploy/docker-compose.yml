@@ -1,0 +1,43 @@
+# Used on the Test/Staging server AND the Production server.
+# The pipeline copies this file to ~/todo on the server and sets the values in ~/todo/.env
+#   IMAGE=ghcr.io/<owner>/<repo>:<git-sha>   (the SAME image in staging and production)
+#   APP_ENV=staging | production
+#   POSTGRES_PASSWORD=<secret>
+services:
+  app:
+    image: ${IMAGE}
+    container_name: todo-app
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV}
+      DB_HOST: db
+      DB_USER: todo
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: todo
+    ports:
+      - "80:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    container_name: todo-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: todo
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: todo
+    volumes:
+      - todo-data:/var/lib/postgresql/data   # tasks survive container re-creation
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U todo"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  todo-data:
+
+networks:
+  default:
+    name: todo-net   # fixed name so test containers and Prometheus can join it
