@@ -1,0 +1,33 @@
+# LOCAL DEVELOPMENT environment: `docker compose up --build` then open http://localhost:3000
+services:
+  app:
+    build:
+      context: .
+      target: prod
+    environment:
+      APP_ENV: development
+      DB_HOST: db
+      DB_USER: todo
+      DB_PASSWORD: todo
+      DB_NAME: todo
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: todo
+      POSTGRES_PASSWORD: todo
+      POSTGRES_DB: todo
+    volumes:
+      - dev-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U todo"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  dev-data:
